@@ -12,6 +12,16 @@ Built to convert the crowdsourced collections
 formats) into directly-loadable v3.0 mirrors, and to filter them down to a
 high-quality training corpus.
 
+**If you just want the data**, the converted collections are published on the
+Hugging Face hub — no conversion needed, each with a card documenting exactly
+what was repaired along the way:
+
+| collection | datasets | episodes | size |
+|---|---|---|---|
+| [`mcobzarenco/community_dataset_v1_v3`](https://huggingface.co/datasets/mcobzarenco/community_dataset_v1_v3) | 128 | 11,132 | 129 GB |
+| [`mcobzarenco/community_dataset_v2_v3`](https://huggingface.co/datasets/mcobzarenco/community_dataset_v2_v3) | 323 | 12,912 | 122 GB |
+| [`mcobzarenco/community_dataset_v3_v3`](https://huggingface.co/datasets/mcobzarenco/community_dataset_v3_v3) | 791 | 50,614 | 737 GB |
+
 ## Install
 
 Requires [uv](https://docs.astral.sh/uv/) and system `ffmpeg`.
