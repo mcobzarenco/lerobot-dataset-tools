@@ -72,13 +72,16 @@ Known source-data issues it handles automatically (all found in the wild):
 
 Newer LeRobot versions write per-feature quantiles (`q01/q10/q50/q90/q99`)
 into `meta/stats.json`; older sources (and the converted collections) lack
-them, and where they DO exist natively they are aggregated from per-episode
-stats — which badly shrinks ranges on dimensions that are near-constant
+them — and where they DO exist natively they are **wrong for corpus use**:
+LeRobot aggregates dataset-level quantiles as a count-weighted *mean* of
+per-episode quantiles, but quantiles don't compose by averaging, so extreme
+quantiles regress toward the median on dimensions that are near-constant
 within episodes (measured: native q01 −54° vs exact −120° on a 50-episode
-SO-101 set). This tool computes **exact corpus quantiles** for `action` and
-`observation.state` and merges them in place; use `--force` to standardize
-provenance across a whole corpus (recommended before fitting anything that
-consumes quantile normalization, e.g. FAST action tokenizers):
+SO-101 set; mean/std/min/max aggregate correctly and are unaffected). This
+tool computes **exact corpus quantiles** for `action` and
+`observation.state` and merges them in place; use `--force` to correct
+datasets carrying native aggregated values (do this before fitting anything
+that consumes quantile normalization, e.g. FAST action tokenizers):
 
 ```bash
 uv run python -m ldtools.backfill_quantile_stats \

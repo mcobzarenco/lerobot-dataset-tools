@@ -21,12 +21,14 @@ Usage:
 Properties:
   - idempotent: sub-datasets whose stats already carry every quantile key
     for both features are skipped (unless ``--force``).
-  - **use --force to standardize a corpus**: LeRobot's native quantiles are
-    aggregated from per-episode stats, which SHRINKS ranges badly on
+  - **use --force to CORRECT a corpus**: LeRobot aggregates dataset-level
+    quantiles as a count-weighted MEAN of per-episode quantiles
+    (``aggregate_feature_stats``) — but quantiles do not compose by
+    averaging, so extreme quantiles regress toward the corpus median on
     dimensions that are near-constant within episodes (measured on a
-    50-episode SO-101 set: native q01 −54° vs exact −120°). Exact corpus
-    quantiles are the FAST paper's definition and the standard here; a
-    corpus mixing native and exact provenance normalizes inconsistently.
+    50-episode SO-101 set: native q01 −54° vs exact −120°). mean/std/
+    min/max aggregate correctly (parallel-variance / min-of-mins) and are
+    unaffected. Exact corpus quantiles are the FAST paper's definition.
   - ``--dry-run`` prints the max absolute difference vs existing values
     without writing anything.
   - failures are collected and reported at the end; exit code 1 if any.
