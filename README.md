@@ -110,25 +110,65 @@ uv run hf upload <user>/community_dataset_v2_v3 \
     /data/community_dataset_v2_v3 --repo-type=dataset
 ```
 
-## Judge episode quality (for filtering)
+## Judge episode quality (for filtering, relabeling and camera tagging)
 
-Two independent judges emit the same strict-JSON verdict (overall score 1–10,
-keep/review/discard, sub-scores, issues) from sampled frames + the task
-instruction + full-trajectory statistics:
+The judges emit a strict-JSON verdict from sampled frames + the task
+instruction + full-trajectory statistics. Schema v2 (`judge_episode`, the
+Anthropic judge) contains:
+
+- `overall_score` 1–10, `verdict` keep/review/discard, per-aspect scores,
+  `issues`, `summary` — quality of the **demonstration**;
+- `instruction_quality` good/vague/mismatched/placeholder — quality of the
+  **label**, judged separately (community task strings are frequently junk
+  like "test1" on top of usable demos: relabel, don't discard);
+- `observed_task` + `suggested_instructions` — grounded relabeling
+  candidates, usable directly as training instructions;
+- `camera_kinds` — per-camera viewpoint map (`wrist`/`top`/`front`/`side`/
+  `unknown`), judged **visually**: the converted collections use anonymized
+  camera names (`image`, `image2`, ...) whose order is inconsistent across
+  datasets, so names carry no signal. Enables train-time camera annotations
+  (with `unknown` as a natural dropout target).
 
 ```bash
 # Anthropic API (needs ANTHROPIC_API_KEY)
 uv run python -m ldtools.judge_episode \
     --root /data/community_dataset_v2_v3/<user>/<ds> --episode 3 [--json] [--dry-run]
 
-# Local Gemma 4 12B (transformers; --load-in-4bit for small GPUs)
+# Local Gemma 4 12B (transformers; --load-in-4bit for small GPUs).
+# NOTE: still on schema v1 (no instruction/camera fields yet).
 uv run python -m ldtools.judge_episode_gemma \
     --root /data/community_dataset_v2_v3/<user>/<ds> --episode 3 --image-token-budget 280
 ```
 
+## Judge sweeps (many datasets, resumable)
+
+`judge_sweep` drives the Anthropic judge over whole collections: skips
+episodes shorter than `--min-frames` (default 50 = one action chunk) loudly
+with a recorded reason, subsamples `--episodes-per-dataset` evenly across
+each dataset's episode range, runs `--workers` episodes concurrently
+(process-isolated — a decoder crash on a corrupt video fails one episode,
+not the sweep), and appends one JSON line per episode to `--output`.
+Re-running skips already-recorded episodes; `--retry-failed` re-attempts
+failures; mixing prompt versions in one log is refused unless
+`--allow-mixed`. Verdicts are greedy (`temperature=0`) and record the model
+id + prompt version for provenance.
+
+```bash
+# plan + rough cost, no API calls
+uv run python -m ldtools.judge_sweep \
+    --roots /data/community_dataset_v1_v3 --output verdicts.jsonl --dry-run
+
+# calibration pilot: 2 episodes per dataset, hard cap 200 calls
+uv run python -m ldtools.judge_sweep \
+    --roots /data/community_dataset_v1_v3 /data/community_dataset_v2_v3 \
+    --output verdicts.jsonl --episodes-per-dataset 2 --max-episodes 200 --workers 4
+```
+
 Calibrate before filtering at scale: judge prompts are strict, and verdicts
 should be validated against a hand-labeled sample before trusting them on a
-full corpus.
+full corpus. Camera-kind tags in particular should be aggregated per dataset
+(majority vote across episodes) — single-episode tags flip on ambiguous
+views (measured on the pilot: downward-looking wrist cams vs `top`).
 
 ## License
 

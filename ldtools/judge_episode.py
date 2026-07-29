@@ -33,7 +33,18 @@ from anthropic.types import ImageBlockParam, TextBlockParam
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from PIL import Image
 
+# CLI defaults. Named so ldtools.judge_sweep (which drives this judge over
+# whole collections) shares the exact same knobs instead of re-hardcoding
+# them; help strings render the live values via argparse's %(default)s.
 DEFAULT_MODEL = "claude-sonnet-4-5"
+DEFAULT_NUM_FRAMES = 6  # sampled timesteps per episode
+DEFAULT_MAX_IMAGE_DIM = 512  # px, longer side after downscaling
+DEFAULT_JPEG_QUALITY = 90
+DEFAULT_MAX_TOKENS = 1500  # response budget
+
+# Bump when SYSTEM_PROMPT or the verdict schema changes; recorded alongside
+# every stored verdict so sweeps/calibration can filter comparable records.
+PROMPT_VERSION = 2
 
 SYSTEM_PROMPT = """\
 You are a robotics dataset curator reviewing teleoperated demonstration
@@ -49,6 +60,30 @@ framed cameras; inconsistent scene setup; frames where the robot
 is outside the camera view. Remember you only see sampled frames — phrase
 temporal claims accordingly (statistics cover the full episode).
 
+Judge the DEMONSTRATION, not the label: a competent demonstration with a
+wrong, empty or placeholder instruction is salvageable by relabeling — do
+not discard for the instruction alone; reflect label problems in
+`instruction_quality` (and rate `task_completion_visible` against the
+stated instruction, "unclear" when it is meaningless).
+
+Classify every camera by what you SEE across the sampled frames — the
+recorded camera names ("image", "image2", ...) are arbitrary and their
+ordering is inconsistent between datasets:
+- "wrist": mounted on a robot arm, the viewpoint moves with it; gripper
+  jaws/fingers typically protrude from a fixed spot at the frame edge while
+  the background shifts between frames.
+- "top": fixed camera looking roughly straight down at the workspace.
+- "front": fixed external camera facing the workspace/robot roughly
+  head-on and horizontally.
+- "side": fixed external camera viewing the workspace from the side or a
+  three-quarter angle.
+- "unknown": genuinely undeterminable from the frames.
+
+For `suggested_instructions`, write 2-3 short imperative commands that
+describe what is actually demonstrated (grounded in the visible objects and
+outcome, varied phrasing, usable directly as training labels). If the
+stated instruction is accurate, include a cleaned-up version of it.
+
 Respond with a single JSON object, no markdown fences, matching:
 {
   "overall_score": <int 1-10>,
@@ -60,9 +95,14 @@ Respond with a single JSON object, no markdown fences, matching:
     "efficiency": <int 1-10>,
     "camera_framing": <int 1-10>
   },
+  "instruction_quality": "good" | "vague" | "mismatched" | "placeholder",
+  "observed_task": "<1-2 sentences: what actually happens>",
+  "suggested_instructions": ["<imperative instruction>", ...],
+  "camera_kinds": {"<camera name>": "wrist" | "top" | "front" | "side" | "unknown", ...},
   "issues": [<short strings>],
   "summary": "<2-4 sentences>"
 }
+`camera_kinds` must contain exactly the camera names listed in the message.
 """
 
 
@@ -83,6 +123,38 @@ class TaskCompletion(StrEnum):
     UNCLEAR = "unclear"
 
 
+class InstructionQuality(StrEnum):
+    """How well the stored task string describes the demonstration.
+
+    Community task strings are frequently junk ("test1", "Test Boulon") on
+    top of perfectly usable demonstrations; this axis is deliberately
+    separate from the quality verdict so good demos with bad labels can be
+    relabeled instead of discarded.
+    """
+
+    GOOD = "good"  # specific and matches what the episode shows
+    VAGUE = "vague"  # generic but compatible ("pick up the object")
+    MISMATCHED = "mismatched"  # describes something visibly different
+    PLACEHOLDER = "placeholder"  # empty/meaningless ("test", "task1", ...)
+
+
+class CameraKind(StrEnum):
+    """Visually judged camera mount/viewpoint category.
+
+    The converted community collections use anonymized camera names
+    ("image", "image2", ...) whose ordering is inconsistent across datasets
+    (measured: 99.9% of 1,242 datasets), so viewpoint semantics can only
+    come from looking at the frames. UNKNOWN is the honest fallback and is
+    also useful as a train-time dropout target for camera annotations.
+    """
+
+    WRIST = "wrist"
+    TOP = "top"
+    FRONT = "front"
+    SIDE = "side"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class Scores:
     """Per-aspect quality sub-scores on a 1-10 scale."""
@@ -97,15 +169,21 @@ class Scores:
 class EpisodeJudgment:
     """Structured verdict returned by the judge model.
 
-    Mirrors the JSON schema demanded in SYSTEM_PROMPT. Use
-    `from_response_text` for raw model output (tolerates surrounding prose
-    or markdown fences) and `to_json`/`from_json` for strict round-trips.
+    Mirrors the JSON schema demanded in SYSTEM_PROMPT (PROMPT_VERSION 2).
+    Use `from_response_text` for raw model output (tolerates surrounding
+    prose or markdown fences) and `to_json`/`from_json` for strict
+    round-trips. All schema-v2 fields are required: a verdict missing them
+    is a parse failure to be retried, not silently backfilled.
     """
 
     overall_score: int
     verdict: Verdict
     task_completion_visible: TaskCompletion
     scores: Scores
+    instruction_quality: InstructionQuality
+    observed_task: str
+    suggested_instructions: tuple[str, ...]
+    camera_kinds: dict[str, CameraKind]
     issues: tuple[str, ...]
     summary: str
 
@@ -113,6 +191,9 @@ class EpisodeJudgment:
     def from_dict(cls, data: dict) -> "EpisodeJudgment":
         try:
             scores = data["scores"]
+            camera_kinds = data["camera_kinds"]
+            if not isinstance(camera_kinds, dict):
+                raise TypeError(f"camera_kinds must be an object, got {type(camera_kinds)}")
             return cls(
                 overall_score=int(data["overall_score"]),
                 verdict=Verdict(data["verdict"]),
@@ -123,11 +204,28 @@ class EpisodeJudgment:
                     efficiency=int(scores["efficiency"]),
                     camera_framing=int(scores["camera_framing"]),
                 ),
+                instruction_quality=InstructionQuality(data["instruction_quality"]),
+                observed_task=str(data["observed_task"]),
+                suggested_instructions=tuple(
+                    str(instruction) for instruction in data["suggested_instructions"]
+                ),
+                camera_kinds={str(name): CameraKind(kind) for name, kind in camera_kinds.items()},
                 issues=tuple(str(issue) for issue in data.get("issues", [])),
                 summary=str(data.get("summary", "")),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"malformed judge verdict: {error}") from error
+
+    def check_cameras(self, expected: list[str]) -> None:
+        """Raise if camera_kinds does not cover exactly the shown cameras.
+
+        The map is only usable downstream (train-time camera annotations)
+        when keyed by the dataset's actual camera names; a judge that
+        renamed or dropped a camera produced an unusable verdict.
+        """
+        got, want = set(self.camera_kinds), set(expected)
+        if got != want:
+            raise ValueError(f"camera_kinds keys {sorted(got)} != cameras shown {sorted(want)}")
 
     @classmethod
     def from_json(cls, text: str) -> "EpisodeJudgment":
@@ -152,12 +250,26 @@ class EpisodeJudgment:
                 "efficiency": self.scores.efficiency,
                 "camera_framing": self.scores.camera_framing,
             },
+            "instruction_quality": self.instruction_quality.value,
+            "observed_task": self.observed_task,
+            "suggested_instructions": list(self.suggested_instructions),
+            "camera_kinds": {name: kind.value for name, kind in self.camera_kinds.items()},
             "issues": list(self.issues),
             "summary": self.summary,
         }
 
     def to_json(self, indent: int | None = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent)
+
+
+def short_camera(key: str) -> str:
+    """Dataset camera names without the feature-key boilerplate.
+
+    "observation.images.image2" -> "image2". These short names are what the
+    judge sees and what `camera_kinds` is keyed by — they match the names
+    other tooling derives from the feature keys.
+    """
+    return key.removeprefix("observation.images.")
 
 
 @dataclass(frozen=True)
@@ -171,9 +283,9 @@ class EpisodeSummary:
     num_frames: int
     duration_s: float
     motor_names: list[str]
-    camera_keys: list[str]
+    camera_names: list[str]  # short names, e.g. "image", "image2"
     stats_text: str
-    # (timestep label, camera key, base64 image) in chronological order
+    # (timestep label, short camera name, base64 image) in chronological order
     frames: list[tuple[str, str, str]]
     media_type: Literal["image/jpeg", "image/png"]
 
@@ -274,10 +386,13 @@ def load_episode_summary(
 
     camera_keys = list(dataset.meta.camera_keys)
     if cameras:
-        unknown = set(cameras) - set(camera_keys)
+        # Accept either full feature keys or short names in the filter.
+        wanted = {short_camera(c) for c in cameras}
+        known = {short_camera(k) for k in camera_keys}
+        unknown = wanted - known
         if unknown:
-            raise SystemExit(f"unknown cameras {sorted(unknown)}; dataset has {camera_keys}")
-        camera_keys = [k for k in camera_keys if k in cameras]
+            raise SystemExit(f"unknown cameras {sorted(unknown)}; dataset has {sorted(known)}")
+        camera_keys = [k for k in camera_keys if short_camera(k) in wanted]
 
     # Evenly spaced timesteps, always including the first and last frame.
     picks = np.unique(np.linspace(0, num_frames - 1, num_timesteps).round().astype(int))
@@ -289,7 +404,7 @@ def load_episode_summary(
             frames.append(
                 (
                     label,
-                    camera,
+                    short_camera(camera),
                     tensor_to_image_b64(item[camera], max_image_dim, image_format, jpeg_quality),
                 )
             )
@@ -302,7 +417,7 @@ def load_episode_summary(
         num_frames=num_frames,
         duration_s=num_frames / fps,
         motor_names=motor_names,
-        camera_keys=camera_keys,
+        camera_names=[short_camera(k) for k in camera_keys],
         stats_text=format_stats(action, state, motor_names, fps),
         frames=frames,
         media_type="image/png" if image_format == "png" else "image/jpeg",
@@ -318,8 +433,8 @@ def build_user_content(
         f"Dataset: {summary.repo_id}, episode {summary.episode}\n"
         f'Task instruction: "{summary.task}"\n'
         f"Length: {summary.num_frames} frames = {summary.duration_s:.1f}s @ {summary.fps:.0f} fps\n"
-        f"Cameras: {', '.join(summary.camera_keys)}\n"
-        f"Sampled timesteps: {len(summary.frames) // max(len(summary.camera_keys), 1)} "
+        f"Cameras: {', '.join(summary.camera_names)}\n"
+        f"Sampled timesteps: {len(summary.frames) // max(len(summary.camera_names), 1)} "
         f"(each shown for every camera, chronological order)"
     )
     content: list[TextBlockParam | ImageBlockParam] = [{"type": "text", "text": intro}]
@@ -342,12 +457,14 @@ def build_user_content(
                 },
             }
         )
+    camera_list = ", ".join(f'"{name}"' for name in summary.camera_names)
     content.append(
         {
             "type": "text",
             "text": "Full-episode trajectory statistics:\n```\n"
             + summary.stats_text
-            + "\n```\nNow give your quality assessment as the specified JSON object.",
+            + "\n```\nNow give your quality assessment as the specified JSON object. "
+            f"`camera_kinds` must have exactly these keys: {camera_list}.",
         }
     )
     return content
@@ -379,7 +496,7 @@ def print_report(
     print(
         f"length   : {summary.num_frames} frames ({summary.duration_s:.1f}s @ {summary.fps:.0f} fps)"
     )
-    print(f"cameras  : {', '.join(summary.camera_keys)}")
+    print(f"cameras  : {', '.join(summary.camera_names)}")
     if usage is not None:
         print(f"tokens   : {usage['input_tokens']} in / {usage['output_tokens']} out")
     print()
@@ -395,6 +512,14 @@ def print_report(
         f"visual_quality={scores.visual_quality}  smoothness={scores.smoothness}  "
         f"efficiency={scores.efficiency}  camera_framing={scores.camera_framing}"
     )
+    print(f"instr    : {judgment.instruction_quality.value}")
+    print(f'observed : "{judgment.observed_task}"')
+    print(
+        "cameras  : "
+        + "  ".join(f"{name}={kind.value}" for name, kind in sorted(judgment.camera_kinds.items()))
+    )
+    for instruction in judgment.suggested_instructions:
+        print(f'  suggest: "{instruction}"')
     print("issues   : " + ("none noted" if not judgment.issues else ""))
     for issue in judgment.issues:
         print(f"  - {issue}")
@@ -416,27 +541,34 @@ def main() -> None:
         "--repo-id",
         type=str,
         default=None,
-        help="Dataset repo id; defaults to the last two path components of --root.",
+        help="Dataset repo id (default: the last two path components of --root).",
     )
-    parser.add_argument("--episode", type=int, default=0, help="Episode index to judge.")
+    parser.add_argument(
+        "--episode",
+        type=int,
+        default=0,
+        help="Episode index to judge (default: %(default)s).",
+    )
     parser.add_argument(
         "--num-frames",
         type=int,
-        default=6,
-        help="Number of timesteps to sample (each sampled for every camera).",
+        default=DEFAULT_NUM_FRAMES,
+        help="Number of timesteps to sample, each shown for every camera (default: %(default)s).",
     )
     parser.add_argument(
         "--cameras",
         type=str,
         nargs="*",
         default=None,
-        help="Subset of camera keys to include (default: all).",
+        help="Camera names to include, short ('wrist') or full "
+        "('observation.images.wrist') (default: all cameras).",
     )
     parser.add_argument(
         "--max-image-dim",
         type=int,
-        default=512,
-        help="Frames are downscaled so the longer side is at most this many pixels.",
+        default=DEFAULT_MAX_IMAGE_DIM,
+        help="Frames are downscaled so the longer side is at most this many pixels "
+        "(default: %(default)s).",
     )
     parser.add_argument(
         "--image-format",
@@ -444,24 +576,38 @@ def main() -> None:
         default="jpeg",
         help="Encoding for uploaded frames. Token cost is identical (it depends on "
         "pixel dimensions); png is lossless w.r.t. the decoded video frame but "
-        "~10x larger on the wire.",
+        "~10x larger on the wire (default: %(default)s).",
     )
     parser.add_argument(
         "--jpeg-quality",
         type=int,
-        default=90,
-        help="JPEG quality (ignored for --image-format=png).",
+        default=DEFAULT_JPEG_QUALITY,
+        help="JPEG quality, ignored for --image-format=png (default: %(default)s).",
     )
     parser.add_argument(
         "--context",
         type=str,
         default=None,
         help="Extra context for the judge, e.g. clarifying an ambiguous task "
-        "instruction or describing the scene setup.",
+        "instruction or describing the scene setup (default: none).",
     )
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
-    parser.add_argument("--max-tokens", type=int, default=1500)
-    parser.add_argument("--json", action="store_true", help="Emit a machine-readable JSON report.")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL,
+        help="Anthropic model id (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Maximum response tokens for the verdict (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable JSON report instead of the text report.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -520,6 +666,7 @@ def main() -> None:
         max_tokens=args.max_tokens,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": content}],
+        temperature=0.0,  # verdicts should be reproducible
     )
     usage = {
         "input_tokens": response.usage.input_tokens,
@@ -528,6 +675,7 @@ def main() -> None:
     raw = "".join(block.text for block in response.content if block.type == "text")
     try:
         judgment: EpisodeJudgment | None = EpisodeJudgment.from_response_text(raw)
+        judgment.check_cameras(summary.camera_names)
     except ValueError as error:
         print(f"warning: {error}", file=sys.stderr)
         judgment = None
