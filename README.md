@@ -1,8 +1,8 @@
 # lerobot-dataset-tools
 
 Tools for migrating [LeRobot](https://github.com/huggingface/lerobot)
-community datasets to the **v3.0 dataset format** and curating their episodes
-with VLM judges.
+community datasets to the **v3.0 dataset format** and repairing their
+metadata.
 
 Built to convert the crowdsourced collections
 [`community_dataset_v1`](https://huggingface.co/datasets/HuggingFaceVLA/community_dataset_v1) /
@@ -110,92 +110,16 @@ uv run hf upload <user>/community_dataset_v2_v3 \
     /data/community_dataset_v2_v3 --repo-type=dataset
 ```
 
-## Judge episode quality (for filtering, relabeling and camera tagging)
+## Judging episode quality
 
-The judges emit a strict-JSON verdict from sampled frames + the task
-instruction + full-trajectory statistics. Schema v2 (`judge_episode`, the
-Anthropic judge) contains:
-
-- `overall_score` 1–10, `verdict` keep/review/discard, per-aspect scores,
-  `issues`, `summary` — quality of the **demonstration**;
-- `instruction_quality` good/vague/mismatched/placeholder — quality of the
-  **label**, judged separately (community task strings are frequently junk
-  like "test1" on top of usable demos: relabel, don't discard);
-- `observed_task` + `suggested_instructions` — grounded relabeling
-  candidates, usable directly as training instructions;
-- `camera_kinds` — per-camera viewpoint map (`wrist`/`top`/`front`/`side`/
-  `unknown`), judged **visually**: the converted collections use anonymized
-  camera names (`image`, `image2`, ...) whose order is inconsistent across
-  datasets, so names carry no signal. Enables train-time camera annotations
-  (with `unknown` as a natural dropout target).
-
-```bash
-# Anthropic API (needs ANTHROPIC_API_KEY)
-uv run python -m ldtools.judge_episode \
-    --root /data/community_dataset_v2_v3/<user>/<ds> --episode 3 [--json] [--dry-run]
-
-# Local Gemma 4 12B (transformers; --load-in-4bit for small GPUs).
-# NOTE: still on schema v1 (no instruction/camera fields yet).
-uv run python -m ldtools.judge_episode_gemma \
-    --root /data/community_dataset_v2_v3/<user>/<ds> --episode 3 --image-token-budget 280
-```
-
-## Judge sweeps (many datasets, resumable)
-
-`judge_sweep` drives the Anthropic judge over whole collections: skips
-episodes shorter than `--min-frames` (default 50 = one action chunk) loudly
-with a recorded reason, subsamples `--episodes-per-dataset` evenly across
-each dataset's episode range, runs `--workers` episodes concurrently
-(process-isolated — a decoder crash on a corrupt video fails one episode,
-not the sweep), and appends one JSON line per episode to `--output`.
-API verdicts are non-deterministic (newer models reject `temperature`, and
-the API never guaranteed determinism even at `temperature=0`); every record
-carries the model id + prompt version for provenance instead.
-
-### Where verdicts live
-
-Two layers. The `--output` JSONL is the run's **journal** (write-ahead log:
-ok and failed records as they stream in, crash-safe). Successful verdicts
-are folded into each dataset's **`meta/judgments.json`** at the end of every
-run (`--merge-only` folds an interrupted run's journal; merging is
-idempotent):
-
-```json
-{"judgments": [{"episode_index": 0, "model": "claude-opus-4-8",
-  "prompt_version": 2, "judged_at": "...", "num_timesteps": 10,
-  "max_image_dim": 512, "usage": {...},
-  "judgment": { ...EpisodeJudgment.to_dict(), verbatim... }}, ...]}
-```
-
-The sidecar lives inside the dataset directory, so hub upload/download
-carries it, and train-time consumers read it next to the rest of the
-metadata — `EpisodeJudgment.from_dict(record["judgment"])` re-validates the
-schema on every load. Records are keyed by `(episode_index, model,
-prompt_version)`: re-running the same configuration is a no-op on any
-machine that has the sidecars; switching model or bumping the prompt
-version re-judges deliberately, and multiple models' verdicts coexist (for
-cascades and cross-model calibration). Failures stay journal-local:
-retrying them is free (evidence gathering fails before any API spend), so
-a fresh machine retries transient ones; `--retry-failed` forces it.
-CAVEAT: lerobot's `delete_episodes` renumbers `episode_index` — a dataset
-rewrite must remap or drop the sidecar.
-
-```bash
-# plan + rough cost, no API calls
-uv run python -m ldtools.judge_sweep \
-    --roots /data/community_dataset_v1_v3 --output verdicts.jsonl --dry-run
-
-# calibration pilot: 2 episodes per dataset, hard cap 200 calls
-uv run python -m ldtools.judge_sweep \
-    --roots /data/community_dataset_v1_v3 /data/community_dataset_v2_v3 \
-    --output verdicts.jsonl --episodes-per-dataset 2 --max-episodes 200 --workers 4
-```
-
-Calibrate before filtering at scale: judge prompts are strict, and verdicts
-should be validated against a hand-labeled sample before trusting them on a
-full corpus. Camera-kind tags in particular should be aggregated per dataset
-(majority vote across episodes) — single-episode tags flip on ambiguous
-views (measured on the pilot: downward-looking wrist cams vs `top`).
+The LLM episode judges (Anthropic API + local Gemma 4, plus the resumable
+sweep that writes per-dataset `meta/judgments.json` sidecars) started here
+and moved to the training repo, where their verdicts are consumed — see
+`bijou/judge` and `docs/episode-judging.md` in
+[flow-matching](https://github.com/mcobzarenco/flow-matching). This repo
+stays focused on format migration and metadata repair; datasets carrying a
+`meta/judgments.json` sidecar remain plain v3.0 datasets (the file is
+additive and ignored by lerobot).
 
 ## License
 
