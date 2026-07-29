@@ -36,8 +36,15 @@ import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from PIL import Image
 
+# CLI defaults, named so `default=` and the help text cannot drift apart
+# (help strings render them via argparse's %(default)s). Kept independent
+# of ldtools.judge_episode's constants on purpose: this is a different
+# judge whose knobs are tuned separately.
 GEMMA_MODEL_ID = "google/gemma-4-12B-it"
 IMAGE_TOKEN_BUDGETS = (70, 140, 280, 560, 1120)
+DEFAULT_NUM_FRAMES = 6  # sampled timesteps per episode
+DEFAULT_MAX_IMAGE_DIM = 512  # px, longer side after downscaling
+DEFAULT_MAX_NEW_TOKENS = 1200  # generation budget (verdict JSON + slack)
 
 JUDGE_SYSTEM_PROMPT = """\
 You are a strict but fair reviewer of robot teleoperation recordings. Each
@@ -484,13 +491,40 @@ def main() -> None:
         "--repo-id",
         type=str,
         default=None,
-        help="Defaults to last two components of --root.",
+        help="Dataset repo id (default: the last two path components of --root).",
     )
-    parser.add_argument("--episode", type=int, default=0)
-    parser.add_argument("--num-frames", type=int, default=6, help="Sampled timesteps.")
-    parser.add_argument("--cameras", type=str, nargs="*", default=None)
-    parser.add_argument("--max-image-dim", type=int, default=512)
-    parser.add_argument("--model", type=str, default=GEMMA_MODEL_ID)
+    parser.add_argument(
+        "--episode",
+        type=int,
+        default=0,
+        help="Episode index to judge (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=DEFAULT_NUM_FRAMES,
+        help="Sampled timesteps, each shown for every camera (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--cameras",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Camera keys to include (default: all cameras).",
+    )
+    parser.add_argument(
+        "--max-image-dim",
+        type=int,
+        default=DEFAULT_MAX_IMAGE_DIM,
+        help="Frames are downscaled so the longer side is at most this many pixels "
+        "(default: %(default)s).",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=GEMMA_MODEL_ID,
+        help="Hugging Face model id (default: %(default)s).",
+    )
     parser.add_argument(
         "--load-in-4bit",
         action="store_true",
@@ -514,9 +548,23 @@ def main() -> None:
         default=None,
         help="Enable sampling at this temperature (default: greedy/deterministic).",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=1200)
-    parser.add_argument("--context", type=str, default=None, help="Extra scene context.")
-    parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=DEFAULT_MAX_NEW_TOKENS,
+        help="Maximum generated tokens for the verdict (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--context",
+        type=str,
+        default=None,
+        help="Extra scene context passed to the judge (default: none).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable JSON report instead of the text report.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
