@@ -165,15 +165,40 @@ class Scores:
     camera_framing: int
 
 
+def _score_1_10(data: dict, field: str) -> int:
+    """1-10 integer score, strictly — what a jsonschema 'integer' + bounds
+    would check, without a second schema document to keep in sync.
+
+    Bare int() coercion lets true -> 1, "7" -> 7 and 7.9 -> 7 slide through
+    silently; a silently-wrong score poisons downstream aggregation, which
+    is worse than a loud parse failure (the sweep records those for
+    --retry-failed). Integer-valued floats (7.0) are accepted — JSON Schema
+    itself treats them as integers.
+    """
+    value = data[field]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field} must be an integer, got {value!r}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{field} must be an integer, got {value!r}")
+        value = int(value)
+    if not 1 <= value <= 10:
+        raise ValueError(f"{field} must be in 1..10, got {value}")
+    return value
+
+
 @dataclass(frozen=True)
 class EpisodeJudgment:
     """Structured verdict returned by the judge model.
 
-    Mirrors the JSON schema demanded in SYSTEM_PROMPT (PROMPT_VERSION 2).
-    Use `from_response_text` for raw model output (tolerates surrounding
-    prose or markdown fences) and `to_json`/`from_json` for strict
-    round-trips. All schema-v2 fields are required: a verdict missing them
-    is a parse failure to be retried, not silently backfilled.
+    Mirrors the JSON schema demanded in SYSTEM_PROMPT (PROMPT_VERSION 2);
+    `from_dict` enforces it exhaustively (required fields, enum membership,
+    integer 1-10 scores, non-empty relabels) — the parser IS the schema,
+    there is deliberately no separate jsonschema document to drift out of
+    sync. Use `from_response_text` for raw model output (tolerates
+    surrounding prose or markdown fences) and `to_json`/`from_json` for
+    strict round-trips. A verdict that violates the schema is a parse
+    failure to be retried, not silently backfilled or clamped.
     """
 
     overall_score: int
@@ -191,24 +216,33 @@ class EpisodeJudgment:
     def from_dict(cls, data: dict) -> "EpisodeJudgment":
         try:
             scores = data["scores"]
+            if not isinstance(scores, dict):
+                raise ValueError(f"scores must be an object, got {type(scores).__name__}")
             camera_kinds = data["camera_kinds"]
-            if not isinstance(camera_kinds, dict):
-                raise TypeError(f"camera_kinds must be an object, got {type(camera_kinds)}")
+            if not isinstance(camera_kinds, dict) or not camera_kinds:
+                raise ValueError("camera_kinds must be a non-empty object")
+            observed_task = str(data["observed_task"]).strip()
+            if not observed_task:
+                raise ValueError("observed_task must be a non-empty string")
+            suggested = data["suggested_instructions"]
+            if not isinstance(suggested, list) or not suggested:
+                raise ValueError("suggested_instructions must be a non-empty array")
+            instructions = tuple(str(entry).strip() for entry in suggested)
+            if not all(instructions):
+                raise ValueError(f"suggested_instructions contains empty entries: {suggested!r}")
             return cls(
-                overall_score=int(data["overall_score"]),
+                overall_score=_score_1_10(data, "overall_score"),
                 verdict=Verdict(data["verdict"]),
                 task_completion_visible=TaskCompletion(data["task_completion_visible"]),
                 scores=Scores(
-                    visual_quality=int(scores["visual_quality"]),
-                    smoothness=int(scores["smoothness"]),
-                    efficiency=int(scores["efficiency"]),
-                    camera_framing=int(scores["camera_framing"]),
+                    visual_quality=_score_1_10(scores, "visual_quality"),
+                    smoothness=_score_1_10(scores, "smoothness"),
+                    efficiency=_score_1_10(scores, "efficiency"),
+                    camera_framing=_score_1_10(scores, "camera_framing"),
                 ),
                 instruction_quality=InstructionQuality(data["instruction_quality"]),
-                observed_task=str(data["observed_task"]),
-                suggested_instructions=tuple(
-                    str(instruction) for instruction in data["suggested_instructions"]
-                ),
+                observed_task=observed_task,
+                suggested_instructions=instructions,
                 camera_kinds={str(name): CameraKind(kind) for name, kind in camera_kinds.items()},
                 issues=tuple(str(issue) for issue in data.get("issues", [])),
                 summary=str(data.get("summary", "")),
