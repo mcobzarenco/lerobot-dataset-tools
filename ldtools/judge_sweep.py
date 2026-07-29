@@ -1,10 +1,25 @@
 """Batch episode-quality judging across LeRobot v3.0 collections (Anthropic API).
 
 Drives ldtools.judge_episode's evidence gathering + prompt over many datasets
-and episodes in parallel, writing one JSON line per episode to a resumable
-verdict log. Episodes shorter than --min-frames are skipped loudly (recorded
-with a reason, counted) — they cannot fill one action chunk and are filtered
-mechanically, no judge needed.
+and episodes in parallel. Two storage layers:
+
+- The --output JSONL is this run's *journal* (write-ahead log): one line per
+  episode as results stream in, ok and failed alike, crash-safe.
+- Each dataset's ``meta/judgments.json`` is the *durable store*: successful
+  verdicts folded in from the journal (auto-merge at the end of every run,
+  or --merge-only to fold a crashed run's journal). It lives inside the
+  dataset directory, so hub upload/download carries it, and train-time
+  consumers read it next to the rest of the metadata. Records round-trip
+  through EpisodeJudgment.to_dict()/from_dict() untouched — re-validated by
+  the schema parser on every load.
+
+Idempotency is keyed on (episode_index, model, prompt_version): re-running
+the same configuration skips everything already judged (on any machine that
+has the sidecars); switching model or bumping the prompt version re-judges
+deliberately. Failures stay journal-local — they cost nothing to retry
+(evidence gathering fails before any API spend) and a fresh machine should
+retry transient ones. Episodes shorter than --min-frames are recomputed at
+plan time (pure function of episode length), skipped loudly, never stored.
 
 Usage:
     # plan only: what would run, rough token/cost estimate
@@ -16,11 +31,8 @@ Usage:
         --roots /data/community_dataset_v1_v3 /data/community_dataset_v2_v3 \
         --output verdicts.jsonl --episodes-per-dataset 2 --workers 4
 
-    # everything (resumable: already-recorded episodes are not re-judged)
-    uv run python -m ldtools.judge_sweep --roots ... --output verdicts.jsonl
-
-Records carry the model id and prompt version; the sweep refuses to append
-records that would mix prompt versions in one log unless --allow-mixed.
+    # fold an interrupted run's journal into the dataset sidecars
+    uv run python -m ldtools.judge_sweep --roots ... --output verdicts.jsonl --merge-only
 """
 
 import argparse
@@ -210,6 +222,8 @@ def judge_one(task: JudgeTask) -> dict:
             duration_s=round(summary.duration_s, 2),
             fps=summary.fps,
             cameras=summary.camera_names,
+            num_timesteps=task.num_timesteps,
+            max_image_dim=task.max_image_dim,
             judgment=judgment.to_dict(),
             usage={
                 "input_tokens": response.usage.input_tokens,
@@ -224,25 +238,159 @@ def judge_one(task: JudgeTask) -> dict:
     return record
 
 
+# --- durable store: meta/judgments.json per dataset --------------------------
+# The envelope is {"judgments": [record, ...]}; each record keeps the exact
+# EpisodeJudgment.to_dict() payload under "judgment" plus provenance fields,
+# keyed by (episode_index, model, prompt_version). Deliberately JSON, not
+# parquet: verdicts are nested, per-dataset counts are tiny (median ~60
+# episodes), and JSON round-trips through the schema-validating dataclass
+# with no flattening layer to maintain.
+
+JUDGMENTS_RELPATH = Path("meta") / "judgments.json"
+
+
+def repo_id_of(dataset_dir: Path) -> str:
+    return f"{dataset_dir.parent.name}/{dataset_dir.name}"
+
+
+def judgment_key(record: dict) -> tuple[int, str, int]:
+    return (int(record["episode_index"]), str(record["model"]), int(record["prompt_version"]))
+
+
+def load_sidecar(dataset_dir: Path) -> list[dict]:
+    """Records from a dataset's judgments sidecar ([] when absent).
+
+    A corrupt sidecar is fatal, not empty: treating it as empty would
+    re-judge and then overwrite whatever the file still holds.
+    """
+    path = dataset_dir / JUDGMENTS_RELPATH
+    if not path.exists():
+        return []
+    try:
+        judgments = json.loads(path.read_text())["judgments"]
+        if not isinstance(judgments, list):
+            raise TypeError(f"'judgments' must be an array, got {type(judgments).__name__}")
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise SystemExit(f"corrupt judgments sidecar {path}: {error}; fix or remove it") from error
+    return judgments
+
+
+def write_sidecar(dataset_dir: Path, records: list[dict]) -> None:
+    """Atomically (re)write a dataset's sidecar, sorted for stable diffs.
+
+    NOTE for the future curation rewrite: lerobot's delete_episodes
+    renumbers episode_index — any dataset rewrite must remap (or
+    deliberately drop) this file, it does not survive renumbering by itself.
+    """
+    path = dataset_dir / JUDGMENTS_RELPATH
+    ordered = sorted(records, key=judgment_key)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"judgments": ordered}, indent=1))
+    tmp.replace(path)
+
+
+def sidecar_record(journal_record: dict) -> dict:
+    """Durable subset of a journal ok-record: key + provenance + the verdict
+    payload exactly as EpisodeJudgment.to_dict() produced it (episode length,
+    fps, task etc. stay journal-only — they are recoverable from the dataset
+    metadata itself)."""
+    return {
+        "episode_index": int(journal_record["episode"]),
+        "model": journal_record["model"],
+        "prompt_version": int(journal_record["prompt_version"]),
+        "judged_at": journal_record["time"],
+        "num_timesteps": journal_record.get("num_timesteps"),
+        "max_image_dim": journal_record.get("max_image_dim"),
+        "usage": journal_record.get("usage"),
+        "judgment": journal_record["judgment"],
+    }
+
+
+def merge_journal(journal: Path, dirs_by_repo: dict[str, Path]) -> None:
+    """Fold the journal's ok-records into dataset sidecars (idempotent).
+
+    Last journal line wins per (episode, model, prompt_version); identical
+    records count as unchanged, so re-merging the same journal is a no-op.
+    Datasets outside the discovered roots are reported loudly and kept in
+    the journal — nothing is dropped.
+    """
+    if not journal.exists():
+        print(f"merge: no journal at {journal}, nothing to fold")
+        return
+    by_repo: dict[str, dict[tuple[int, str, int], dict]] = {}
+    with journal.open() as f:
+        for line in f:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("status") != "ok":
+                continue
+            new = sidecar_record(record)
+            by_repo.setdefault(record["dataset"], {})[judgment_key(new)] = new
+    added = replaced = unchanged = 0
+    missing: list[str] = []
+    for repo, new_records in sorted(by_repo.items()):
+        dataset_dir = dirs_by_repo.get(repo)
+        if dataset_dir is None:
+            missing.append(repo)
+            continue
+        existing = {judgment_key(r): r for r in load_sidecar(dataset_dir)}
+        changed = False
+        for key, record in new_records.items():
+            old = existing.get(key)
+            if old == record:
+                unchanged += 1
+                continue
+            added += old is None
+            replaced += old is not None
+            existing[key] = record
+            changed = True
+        if changed:
+            write_sidecar(dataset_dir, list(existing.values()))
+    print(
+        f"merge: {added} added, {replaced} replaced, {unchanged} unchanged "
+        f"across {len(by_repo)} dataset(s) -> meta/judgments.json"
+    )
+    if missing:
+        print(
+            f"merge: {len(missing)} journal dataset(s) not under --roots, NOT folded "
+            f"(e.g. {missing[:3]}); re-run --merge-only with the right roots",
+            file=sys.stderr,
+        )
+
+
 # --- driver -----------------------------------------------------------------
 
 
-def load_done(output: Path, retry_failed: bool) -> tuple[set[tuple[str, int]], set[int]]:
-    """Keys already recorded (to skip) and prompt versions seen in the log."""
-    done: set[tuple[str, int]] = set()
-    versions: set[int] = set()
+def load_journal_done(
+    output: Path, *, retry_failed: bool
+) -> tuple[set[tuple[str, int, str, int]], set[tuple[str, int]]]:
+    """Journal-side skip sets: ok keys (dataset, episode, model, prompt
+    version) — covering results not yet folded into sidecars — and failed
+    (dataset, episode) pairs (empty when retrying; failure skip is
+    model-agnostic because failures are overwhelmingly evidence-side, e.g.
+    corrupt video, and would fail identically under any judge)."""
+    ok: set[tuple[str, int, str, int]] = set()
+    failed: set[tuple[str, int]] = set()
     if not output.exists():
-        return done, versions
+        return ok, failed
     with output.open() as f:
         for line in f:
             if not line.strip():
                 continue
             record = json.loads(line)
-            versions.add(int(record.get("prompt_version", 1)))
-            if retry_failed and record.get("status") == "failed":
-                continue
-            done.add((record["dataset"], int(record["episode"])))
-    return done, versions
+            if record.get("status") == "ok":
+                ok.add(
+                    (
+                        record["dataset"],
+                        int(record["episode"]),
+                        str(record["model"]),
+                        int(record["prompt_version"]),
+                    )
+                )
+            elif record.get("status") == "failed" and not retry_failed:
+                failed.add((record["dataset"], int(record["episode"])))
+    return ok, failed
 
 
 def estimate_cost(episodes: int, images: int, model: str) -> str:
@@ -278,8 +426,9 @@ def main() -> None:
         "--output",
         type=Path,
         required=True,
-        help="Verdict JSONL, one record per episode (appended; existing records "
-        "are not re-judged).",
+        help="Journal JSONL for this run (appended, crash-safe); successful "
+        "verdicts are folded into each dataset's meta/judgments.json at the "
+        "end of the run.",
     )
     parser.add_argument(
         "--min-frames",
@@ -337,24 +486,29 @@ def main() -> None:
     parser.add_argument(
         "--retry-failed",
         action="store_true",
-        help="Re-attempt episodes whose existing record has status=failed.",
+        help="Re-attempt episodes whose journal record has status=failed.",
     )
     parser.add_argument(
-        "--allow-mixed",
+        "--merge-only",
         action="store_true",
-        help="Append to a log recorded with a different prompt version.",
+        help="Fold the journal's verdicts into the dataset sidecars and exit "
+        "(no judging; use after an interrupted run). Covers all datasets "
+        "under --roots regardless of --datasets.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Plan and estimate only.")
     args = parser.parse_args()
 
     dataset_dirs = discover_datasets(args.roots)
+    dirs_by_repo = {repo_id_of(d): d for d in dataset_dirs}
+    if args.merge_only:
+        merge_journal(args.output, dirs_by_repo)
+        return
     if args.datasets is not None:
         wanted = set(args.datasets)
-        by_id = {f"{d.parent.name}/{d.name}": d for d in dataset_dirs}
-        unknown = wanted - set(by_id)
+        unknown = wanted - set(dirs_by_repo)
         if unknown:
             raise SystemExit(f"unknown datasets: {sorted(unknown)}")
-        dataset_dirs = [by_id[name] for name in sorted(wanted)]
+        dataset_dirs = [dirs_by_repo[name] for name in sorted(wanted)]
 
     plans: list[DatasetPlan] = []
     plan_failures: list[tuple[str, str]] = []
@@ -366,31 +520,20 @@ def main() -> None:
             plan_failures.append((repo_id, str(error)))
             print(f"PLAN FAILED {repo_id}: {error}", file=sys.stderr)
 
-    done, versions = load_done(args.output, retry_failed=args.retry_failed)
-    if versions and versions != {PROMPT_VERSION} and not args.allow_mixed:
-        raise SystemExit(
-            f"{args.output} contains prompt version(s) {sorted(versions)} but this code is "
-            f"version {PROMPT_VERSION}; use a fresh --output or --allow-mixed"
-        )
+    journal_ok, journal_failed = load_journal_done(args.output, retry_failed=args.retry_failed)
 
     cameras_by_repo = {plan.repo_id: plan.cameras for plan in plans}
     tasks: list[JudgeTask] = []
-    new_skips: list[dict] = []
+    already = 0
     for plan in plans:
-        for episode, length in plan.skipped:
-            if (plan.repo_id, episode) not in done:
-                new_skips.append(
-                    {
-                        "dataset": plan.repo_id,
-                        "episode": episode,
-                        "time": time.strftime("%F %T", time.gmtime()),
-                        "status": "skipped",
-                        "reason": f"length {length} < --min-frames {args.min_frames}",
-                        "prompt_version": PROMPT_VERSION,
-                    }
-                )
+        sidecar_keys = {judgment_key(record) for record in load_sidecar(plan.root)}
         for episode in plan.to_judge:
-            if (plan.repo_id, episode) in done:
+            if (
+                (episode, args.model, PROMPT_VERSION) in sidecar_keys
+                or (plan.repo_id, episode, args.model, PROMPT_VERSION) in journal_ok
+                or (plan.repo_id, episode) in journal_failed
+            ):
+                already += 1
                 continue
             tasks.append(
                 JudgeTask(
@@ -412,7 +555,8 @@ def main() -> None:
     skipped_total = sum(len(p.skipped) for p in plans)
     print(
         f"plan: {len(plans)} datasets | {planned} episodes eligible | "
-        f"{skipped_total} below {args.min_frames} frames | {len(done)} already recorded | "
+        f"{skipped_total} below {args.min_frames} frames | "
+        f"{already} already judged for ({args.model}, v{PROMPT_VERSION}) | "
         f"{len(tasks)} to judge now | {len(plan_failures)} datasets failed to plan"
     )
     print(f"cost: {estimate_cost(len(tasks), total_images, args.model)}")
@@ -425,64 +569,52 @@ def main() -> None:
         raise SystemExit("ANTHROPIC_API_KEY is not set (required unless --dry-run)")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    outcomes = {"ok": 0, "failed": 0, "skipped": len(new_skips)}
+    if not tasks:
+        print("nothing to judge")
+        # Still fold: the journal may hold results from an interrupted run.
+        merge_journal(args.output, dirs_by_repo)
+        return
+
+    outcomes = {"ok": 0, "failed": 0}
     tokens_in = tokens_out = 0
-    with args.output.open("a") as log:
-        for skip in new_skips:
-            log.write(json.dumps(skip) + "\n")
-        for repo_id, error in plan_failures:
-            log.write(
-                json.dumps(
-                    {
-                        "dataset": repo_id,
-                        "episode": -1,
-                        "time": time.strftime("%F %T", time.gmtime()),
-                        "status": "failed",
-                        "error": f"planning: {error}",
-                        "prompt_version": PROMPT_VERSION,
-                    }
+    # spawn (not fork): workers decode video; forking a torch-loaded
+    # parent into AV1 decoders is asking for latent corruption.
+    context = mp.get_context("spawn")
+    started = time.perf_counter()
+    with (
+        args.output.open("a") as log,
+        ProcessPoolExecutor(max_workers=args.workers, mp_context=context) as pool,
+    ):
+        futures = {pool.submit(judge_one, task): task for task in tasks}
+        for i, future in enumerate(as_completed(futures), start=1):
+            record = future.result()
+            log.write(json.dumps(record) + "\n")
+            log.flush()
+            outcomes[record["status"]] += 1
+            usage = record.get("usage")
+            if usage:
+                tokens_in += usage["input_tokens"]
+                tokens_out += usage["output_tokens"]
+            if record["status"] == "failed":
+                print(
+                    f"FAILED {record['dataset']} ep {record['episode']}: {record['error']}",
+                    file=sys.stderr,
                 )
-                + "\n"
-            )
-        log.flush()
-        if not tasks:
-            print("nothing to do")
-            return
+            if i % 25 == 0 or i == len(tasks):
+                rate = i / (time.perf_counter() - started)
+                print(
+                    f"[{i}/{len(tasks)}] ok={outcomes['ok']} failed={outcomes['failed']} "
+                    f"| {tokens_in:,} in / {tokens_out:,} out tokens | {rate:.2f} eps/s",
+                    flush=True,
+                )
 
-        # spawn (not fork): workers decode video; forking a torch-loaded
-        # parent into AV1 decoders is asking for latent corruption.
-        context = mp.get_context("spawn")
-        started = time.perf_counter()
-        with ProcessPoolExecutor(max_workers=args.workers, mp_context=context) as pool:
-            futures = {pool.submit(judge_one, task): task for task in tasks}
-            for i, future in enumerate(as_completed(futures), start=1):
-                record = future.result()
-                log.write(json.dumps(record) + "\n")
-                log.flush()
-                outcomes[record["status"]] += 1
-                usage = record.get("usage")
-                if usage:
-                    tokens_in += usage["input_tokens"]
-                    tokens_out += usage["output_tokens"]
-                if record["status"] == "failed":
-                    print(
-                        f"FAILED {record['dataset']} ep {record['episode']}: {record['error']}",
-                        file=sys.stderr,
-                    )
-                if i % 25 == 0 or i == len(tasks):
-                    rate = i / (time.perf_counter() - started)
-                    print(
-                        f"[{i}/{len(tasks)}] ok={outcomes['ok']} failed={outcomes['failed']} "
-                        f"| {tokens_in:,} in / {tokens_out:,} out tokens | {rate:.2f} eps/s",
-                        flush=True,
-                    )
-
+    merge_journal(args.output, dirs_by_repo)
     for prefix, (in_price, out_price) in MODEL_PRICES.items():
         if args.model.startswith(prefix):
             spent = (tokens_in * in_price + tokens_out * out_price) / 1e6
             print(f"spent: ~${spent:,.2f} ({tokens_in:,} in / {tokens_out:,} out tokens, rough)")
             break
-    print(f"done: {outcomes} -> {args.output}")
+    print(f"done: {outcomes} -> {args.output} + sidecars")
 
 
 if __name__ == "__main__":

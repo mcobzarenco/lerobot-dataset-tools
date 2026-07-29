@@ -148,12 +148,37 @@ with a recorded reason, subsamples `--episodes-per-dataset` evenly across
 each dataset's episode range, runs `--workers` episodes concurrently
 (process-isolated — a decoder crash on a corrupt video fails one episode,
 not the sweep), and appends one JSON line per episode to `--output`.
-Re-running skips already-recorded episodes; `--retry-failed` re-attempts
-failures; mixing prompt versions in one log is refused unless
-`--allow-mixed`. API verdicts are non-deterministic (newer models reject
-`temperature`, and the API never guaranteed determinism even at
-`temperature=0`); every record carries the model id + prompt version for
-provenance instead.
+API verdicts are non-deterministic (newer models reject `temperature`, and
+the API never guaranteed determinism even at `temperature=0`); every record
+carries the model id + prompt version for provenance instead.
+
+### Where verdicts live
+
+Two layers. The `--output` JSONL is the run's **journal** (write-ahead log:
+ok and failed records as they stream in, crash-safe). Successful verdicts
+are folded into each dataset's **`meta/judgments.json`** at the end of every
+run (`--merge-only` folds an interrupted run's journal; merging is
+idempotent):
+
+```json
+{"judgments": [{"episode_index": 0, "model": "claude-opus-4-8",
+  "prompt_version": 2, "judged_at": "...", "num_timesteps": 10,
+  "max_image_dim": 512, "usage": {...},
+  "judgment": { ...EpisodeJudgment.to_dict(), verbatim... }}, ...]}
+```
+
+The sidecar lives inside the dataset directory, so hub upload/download
+carries it, and train-time consumers read it next to the rest of the
+metadata — `EpisodeJudgment.from_dict(record["judgment"])` re-validates the
+schema on every load. Records are keyed by `(episode_index, model,
+prompt_version)`: re-running the same configuration is a no-op on any
+machine that has the sidecars; switching model or bumping the prompt
+version re-judges deliberately, and multiple models' verdicts coexist (for
+cascades and cross-model calibration). Failures stay journal-local:
+retrying them is free (evidence gathering fails before any API spend), so
+a fresh machine retries transient ones; `--retry-failed` forces it.
+CAVEAT: lerobot's `delete_episodes` renumbers `episode_index` — a dataset
+rewrite must remap or drop the sidecar.
 
 ```bash
 # plan + rough cost, no API calls
