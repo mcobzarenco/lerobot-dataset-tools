@@ -36,8 +36,8 @@ from PIL import Image
 # CLI defaults. Named so ldtools.judge_sweep (which drives this judge over
 # whole collections) shares the exact same knobs instead of re-hardcoding
 # them; help strings render the live values via argparse's %(default)s.
-DEFAULT_MODEL = "claude-sonnet-4-5"
-DEFAULT_NUM_FRAMES = 6  # sampled timesteps per episode
+DEFAULT_MODEL = "claude-opus-4-8"  # $5/$25 per MTok (2026-07)
+DEFAULT_NUM_FRAMES = 10  # sampled timesteps per episode
 DEFAULT_MAX_IMAGE_DIM = 512  # px, longer side after downscaling
 DEFAULT_JPEG_QUALITY = 90
 DEFAULT_MAX_TOKENS = 1500  # response budget
@@ -609,6 +609,12 @@ def main() -> None:
         help="Emit a machine-readable JSON report instead of the text report.",
     )
     parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Print the model's verbatim response text instead of any report "
+        "(parse problems still warn on stderr).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Build and describe the payload without requesting a completion. "
@@ -679,6 +685,9 @@ def main() -> None:
     except ValueError as error:
         print(f"warning: {error}", file=sys.stderr)
         judgment = None
+    if args.raw:
+        print(raw)
+        return
     print_report(summary, judgment, raw, as_json=args.json, usage=usage)
 
 

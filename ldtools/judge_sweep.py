@@ -57,11 +57,14 @@ DEFAULT_WORKERS = 4
 # Rough $/Mtok (input, output) as of 2026-07; used only for --dry-run and the
 # end-of-run summary, clearly labeled as estimates. Unknown models get none.
 MODEL_PRICES = {
+    "claude-opus-4-8": (5.0, 25.0),
     "claude-sonnet-4-5": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
 }
 # ~(512*384)/750 vision tokens for a 640x480 frame thumbnailed to 512, plus
-# text overhead measured on pilot episodes; rough by design.
+# text overhead measured on pilot episodes; rough by design. Calibrated on
+# the Sonnet 4.5 tokenizer — models >= 4.7 tokenize text ~30% heavier, so
+# expect estimates to run a bit low there.
 EST_TOKENS_PER_IMAGE = 262
 EST_TEXT_TOKENS = 1400
 EST_OUTPUT_TOKENS = 450
