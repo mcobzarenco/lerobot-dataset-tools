@@ -28,8 +28,8 @@ from typing import Literal
 
 import numpy as np
 import torch
-from anthropic import Anthropic, BadRequestError
-from anthropic.types import ImageBlockParam, Message, TextBlockParam
+from anthropic import Anthropic
+from anthropic.types import ImageBlockParam, TextBlockParam
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from PIL import Image
 
@@ -104,41 +104,6 @@ Respond with a single JSON object, no markdown fences, matching:
 }
 `camera_kinds` must contain exactly the camera names listed in the message.
 """
-
-
-# Models that rejected `temperature` ("deprecated for this model", 400 — the
-# 4.7+ generation dropped sampling controls; greedy-by-contract). Populated
-# at call time so each process pays the probe request at most once per model.
-_TEMPERATURE_UNSUPPORTED: set[str] = set()
-
-
-def create_judgment_message(
-    client: Anthropic,
-    model: str,
-    max_tokens: int,
-    content: list[TextBlockParam | ImageBlockParam],
-) -> Message:
-    """messages.create pinned to temperature=0 where the model supports it.
-
-    Older models default to temperature 1.0, so reproducible verdicts need
-    the explicit pin; newer models reject the parameter outright. Retry
-    without it on that specific 400 and remember per model.
-    """
-    request = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": content}],
-    }
-    if model in _TEMPERATURE_UNSUPPORTED:
-        return client.messages.create(**request)
-    try:
-        return client.messages.create(**request, temperature=0.0)
-    except BadRequestError as error:
-        if "temperature" not in str(error):
-            raise
-        _TEMPERATURE_UNSUPPORTED.add(model)
-        return client.messages.create(**request)
 
 
 class Verdict(StrEnum):
@@ -702,7 +667,17 @@ def main() -> None:
         raise SystemExit(2)
 
     client = Anthropic()
-    response = create_judgment_message(client, args.model, args.max_tokens, content)
+    # Deliberately no sampling controls: opus 4.7+ rejects `temperature`
+    # with a 400, and the API reference never promised determinism even at
+    # temperature=0 — API verdicts are inherently non-reproducible. The
+    # local Gemma judge (greedy decode) is the path to reproducible
+    # verdicts if that ever becomes load-bearing.
+    response = client.messages.create(
+        model=args.model,
+        max_tokens=args.max_tokens,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": content}],
+    )
     usage = {
         "input_tokens": response.usage.input_tokens,
         "output_tokens": response.usage.output_tokens,

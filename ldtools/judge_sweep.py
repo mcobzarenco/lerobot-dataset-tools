@@ -43,9 +43,9 @@ from ldtools.judge_episode import (
     DEFAULT_MODEL,
     DEFAULT_NUM_FRAMES,
     PROMPT_VERSION,
+    SYSTEM_PROMPT,
     EpisodeJudgment,
     build_user_content,
-    create_judgment_message,
     load_episode_summary,
 )
 
@@ -191,11 +191,14 @@ def judge_one(task: JudgeTask) -> dict:
             cameras=None,
         )
         content = build_user_content(summary)
-        response = create_judgment_message(
-            _client(),
-            task.model,
-            task.max_tokens,
-            content,
+        # No sampling controls: opus 4.7+ rejects `temperature`, and the API
+        # never guaranteed determinism anyway — verdicts are non-reproducible
+        # by nature; records carry model + prompt_version instead.
+        response = _client().messages.create(
+            model=task.model,
+            max_tokens=task.max_tokens,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
         )
         raw = "".join(block.text for block in response.content if block.type == "text")
         judgment = EpisodeJudgment.from_response_text(raw)

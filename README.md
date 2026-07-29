@@ -150,8 +150,10 @@ each dataset's episode range, runs `--workers` episodes concurrently
 not the sweep), and appends one JSON line per episode to `--output`.
 Re-running skips already-recorded episodes; `--retry-failed` re-attempts
 failures; mixing prompt versions in one log is refused unless
-`--allow-mixed`. Verdicts are greedy (`temperature=0`) and record the model
-id + prompt version for provenance.
+`--allow-mixed`. API verdicts are non-deterministic (newer models reject
+`temperature`, and the API never guaranteed determinism even at
+`temperature=0`); every record carries the model id + prompt version for
+provenance instead.
 
 ```bash
 # plan + rough cost, no API calls
