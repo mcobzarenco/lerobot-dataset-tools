@@ -48,6 +48,8 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
+import tempfile
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -168,6 +170,39 @@ def hardlink_tree(source: Path, destination: Path) -> None:
             os.link(path, target)
 
 
+def verify_keyframe_starts(source_path: Path, starts: list[float], fps: float) -> None:
+    """Demux-only check that every span start lands on a keyframe.
+
+    Measured 130/130 on sample datasets, but this is the invariant lossless
+    remuxing rests on — violations fail the dataset loudly (re-encoding is
+    lossy and deliberately NOT a silent fallback).
+    """
+    with av.open(str(source_path)) as source:
+        stream = source.streams.video[0]
+        time_base = stream.time_base or Fraction(1, 90000)
+        keyframes = {
+            float(packet.pts * time_base)
+            for packet in source.demux(stream)
+            if packet.is_keyframe and packet.pts is not None
+        }
+    half_frame = 0.5 / fps
+    for start in starts:
+        if not any(abs(start - keyframe) < half_frame for keyframe in keyframes):
+            raise ValueError(
+                f"{source_path.name}: span start {start:.3f}s is not a keyframe — "
+                "remux impossible without lossy re-encode"
+            )
+
+
+def ffmpeg(*arguments: str) -> None:
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def remux_camera(
     dataset_dir: Path,
     out_dir: Path,
@@ -176,13 +211,15 @@ def remux_camera(
     keep: list[int],
     fps: float,
 ) -> dict[int, tuple[int, int, float, float]]:
-    """Packet-copy kept episode spans into fresh video files.
+    """Stream-copy kept episode spans into fresh video files (no re-encode).
 
-    Returns per (original) episode: (chunk_index, file_index,
-    from_timestamp, to_timestamp) in the OUTPUT layout — one output file
-    per source file that still holds kept episodes, renumbered densely.
-    Raises when a kept span does not start on a keyframe (re-encoding is
-    lossy; such files are a loud dataset failure, not a silent fallback).
+    Cuts each span with ffmpeg ``-ss <keyframe> -c copy`` and joins them
+    with the concat demuxer — the same system-ffmpeg toolchain
+    convert_collection uses (PyAV's output-side codec lookup chokes on
+    AV1: UnknownCodecError libdav1d; PyAV stays demux-only here). Returns
+    per (original) episode: (chunk_index, file_index, from_timestamp,
+    to_timestamp) in the OUTPUT layout — one output file per source file
+    that still holds kept episodes, renumbered densely.
     """
     meta = episodes_meta.set_index("episode_index")
     by_source: dict[tuple[int, int], list[int]] = {}
@@ -194,7 +231,6 @@ def remux_camera(
         by_source.setdefault(key, []).append(episode)
 
     placement: dict[int, tuple[int, int, float, float]] = {}
-    half_frame = 0.5 / fps
     for out_file_index, (source_key, source_episodes) in enumerate(sorted(by_source.items())):
         chunk_index, file_index = source_key
         source_path = (
@@ -215,53 +251,45 @@ def remux_camera(
             )
             for episode in source_episodes
         )
-        with av.open(str(source_path)) as source, av.open(str(out_path), "w") as out:
-            in_stream = source.streams.video[0]
-            time_base = in_stream.time_base or Fraction(1, 90000)
-            out_stream = out.add_stream_from_template(in_stream)
-            offset = 0.0
-            span_pts: dict[
-                int, tuple[int, int, int]
-            ] = {}  # episode -> (from_pts, to_pts, new_base_pts)
-            for from_ts, to_ts, episode in spans:
-                placement[episode] = (0, out_file_index, offset, offset + (to_ts - from_ts))
-                span_pts[episode] = (
-                    round(from_ts / time_base),
-                    round(to_ts / time_base),
-                    round(offset / time_base),
-                )
-                offset += to_ts - from_ts
+        verify_keyframe_starts(source_path, [span[0] for span in spans], fps)
 
-            ordered = sorted(span_pts.items(), key=lambda kv: kv[1][0])
-            span_cursor = 0
-            first_packet_of_span = True
-            for packet in source.demux(in_stream):
-                if packet.pts is None:
-                    continue
-                while span_cursor < len(ordered) and packet.pts >= ordered[span_cursor][1][1]:
-                    span_cursor += 1
-                    first_packet_of_span = True
-                if span_cursor >= len(ordered):
-                    break
-                from_pts, to_pts, new_base = ordered[span_cursor][1]
-                if not from_pts <= packet.pts < to_pts:
-                    continue
-                if first_packet_of_span:
-                    if not packet.is_keyframe or packet.pts > from_pts + round(
-                        half_frame / time_base
-                    ):
-                        raise ValueError(
-                            f"{source_path.name}: episode {ordered[span_cursor][0]} span does "
-                            f"not start on a keyframe (pts {packet.pts}, expected {from_pts}) — "
-                            "remux impossible without lossy re-encode"
-                        )
-                    first_packet_of_span = False
-                shift = new_base - from_pts
-                packet.pts += shift
-                if packet.dts is not None:
-                    packet.dts += shift
-                packet.stream = out_stream
-                out.mux(packet)
+        offset = 0.0
+        with tempfile.TemporaryDirectory(prefix="remux_") as scratch_name:
+            scratch = Path(scratch_name)
+            parts: list[Path] = []
+            for span_index, (from_ts, to_ts, episode) in enumerate(spans):
+                duration = to_ts - from_ts
+                part = scratch / f"part_{span_index:04d}.mp4"
+                ffmpeg(
+                    "-ss",
+                    f"{from_ts:.6f}",
+                    "-i",
+                    str(source_path),
+                    "-t",
+                    f"{duration:.6f}",
+                    "-c",
+                    "copy",
+                    "-an",
+                    "-avoid_negative_ts",
+                    "make_zero",
+                    str(part),
+                )
+                parts.append(part)
+                placement[episode] = (0, out_file_index, offset, offset + duration)
+                offset += duration
+            concat_list = scratch / "concat.txt"
+            concat_list.write_text("".join(f"file '{part}'\n" for part in parts))
+            ffmpeg(
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list),
+                "-c",
+                "copy",
+                str(out_path),
+            )
     return placement
 
 
