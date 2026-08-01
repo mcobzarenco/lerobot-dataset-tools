@@ -475,16 +475,19 @@ def main() -> int:
     args = parser.parse_args()
 
     datasets = discover(args.sources)
+    # Length-outlier threshold over the whole INPUT scope, computed BEFORE
+    # any --datasets subsetting: the marathon cut is a property of the
+    # corpus, not of whichever subset this invocation processes (a 6-dataset
+    # test run once derived max_frames=656 and would have shredded normal
+    # episodes).
+    all_lengths = np.concatenate([episode_lengths(d)["length"].to_numpy() for d in datasets])
+    max_frames = int(np.quantile(all_lengths, args.max_frames_quantile))
     if args.datasets is not None:
         by_id = {f"{d.parent.name}/{d.name}": d for d in datasets}
         unknown = set(args.datasets) - set(by_id)
         if unknown:
             raise SystemExit(f"unknown datasets: {sorted(unknown)}")
         datasets = [by_id[name] for name in sorted(set(args.datasets))]
-
-    # Length-outlier threshold over the whole INPUT scope (meta-only pass).
-    all_lengths = np.concatenate([episode_lengths(d)["length"].to_numpy() for d in datasets])
-    max_frames = int(np.quantile(all_lengths, args.max_frames_quantile))
     thresholds = Thresholds(
         min_frames=args.min_frames,
         min_seconds=args.min_seconds,
@@ -521,6 +524,9 @@ def main() -> int:
             print(
                 f"{result['status'].upper()} {result['dataset']}: {result.get('reason') or result.get('error')}"
             )
+        if args.dry_run:
+            for episode, reason in result.get("drops", {}).items():
+                print(f"  drop {result['dataset']} ep {episode}: {reason}")
         if not args.dry_run:
             with manifest.open("a") as f:
                 f.write(json.dumps(result) + "\n")
