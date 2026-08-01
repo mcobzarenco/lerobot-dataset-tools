@@ -376,6 +376,40 @@ def rebuild_dataset(
     kept_meta["data/file_index"] = 0
     kept_meta["meta/episodes/chunk_index"] = 0
     kept_meta["meta/episodes/file_index"] = 0
+
+    # Renumbering invalidates the per-episode stats of the episode_index and
+    # index FEATURES (constant per episode / contiguous range per episode).
+    # lerobot's own delete_episodes copies these verbatim — stale — and they
+    # then poison the aggregated stats.json; recompute analytically. Only
+    # keys already present as columns are written (converted v2.0 sources
+    # lack quantile columns).
+    quantile_keys = {"q01": 0.01, "q10": 0.10, "q50": 0.50, "q90": 0.90, "q99": 0.99}
+    for position, (new_episode, start, length) in enumerate(
+        zip(kept_meta["episode_index"].to_list(), starts.tolist(), lengths.tolist(), strict=True)
+    ):
+        end = start + length - 1  # inclusive global row range
+        analytic: dict[str, dict[str, float]] = {
+            "episode_index": {
+                "min": new_episode,
+                "max": new_episode,
+                "mean": new_episode,
+                "std": 0.0,
+                **{key: float(new_episode) for key in quantile_keys},
+            },
+            "index": {
+                "min": start,
+                "max": end,
+                "mean": (start + end) / 2.0,
+                "std": float(np.sqrt((length**2 - 1) / 12.0)),
+                **{key: start + q * (length - 1) for key, q in quantile_keys.items()},
+            },
+        }
+        row = kept_meta.index[position]
+        for feature, entry in analytic.items():
+            for key, value in entry.items():
+                column = f"stats/{feature}/{key}"
+                if column in kept_meta.columns:
+                    kept_meta.at[row, column] = np.array([value])
     for camera in [f"observation.images.{c}" for c in cameras]:
         placement = placements[camera]
         kept_meta[f"videos/{camera}/chunk_index"] = [placement[e][0] for e in original_order]
