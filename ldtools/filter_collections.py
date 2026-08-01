@@ -294,6 +294,15 @@ def remux_camera(
     return placement
 
 
+def deep_float(value: object) -> np.ndarray:
+    """Flatten arbitrarily nested object arrays (parquet list-of-list round
+    trips) into a 1-D float64 array."""
+    array = np.asarray(value)
+    while array.dtype == object:
+        array = np.concatenate([np.atleast_1d(np.asarray(v)) for v in array.ravel()])
+    return array.astype(np.float64).ravel()
+
+
 def unflatten_episode_stats(row: pd.Series) -> dict[str, dict[str, np.ndarray]]:
     stats: dict[str, dict[str, np.ndarray]] = {}
     for column_name in row.index:
@@ -304,12 +313,15 @@ def unflatten_episode_stats(row: pd.Series) -> dict[str, dict[str, np.ndarray]]:
         value = row[column]
         if value is None:
             continue
-        array = np.asarray(value)
-        # Image stats live as flat [3] vectors in the episodes parquet but
-        # lerobot's aggregate_stats demands the original [3,1,1] (except
-        # the scalar count) — restore the shape it validates against.
-        if feature.startswith("observation.images.") and key != "count":
-            array = array.reshape(3, 1, 1)
+        if key == "count":
+            array = np.atleast_1d(np.asarray(value)).astype(np.int64)
+        else:
+            array = deep_float(value)
+            # Image stats live flattened in the episodes parquet but
+            # lerobot's aggregate_stats validates against the original
+            # [3, 1, 1] shape — restore it.
+            if feature.startswith("observation.images."):
+                array = array.reshape(3, 1, 1)
         stats.setdefault(feature, {})[key] = array
     return stats
 
