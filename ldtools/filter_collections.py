@@ -408,8 +408,14 @@ def rebuild_dataset(
         for feature, entry in analytic.items():
             for key, value in entry.items():
                 column = f"stats/{feature}/{key}"
-                if column in kept_meta.columns:
-                    kept_meta.at[row, column] = np.array([value])
+                if column not in kept_meta.columns:
+                    continue
+                # Match the column's existing element dtype (min/max are
+                # int64 lists, mean/std/quantiles float64) — mixed dtypes
+                # in one object column break the parquet conversion.
+                current = np.asarray(kept_meta.at[row, column]).ravel()
+                dtype = current.dtype if current.size else np.float64
+                kept_meta.at[row, column] = np.array([value], dtype=dtype)
     for camera in [f"observation.images.{c}" for c in cameras]:
         placement = placements[camera]
         kept_meta[f"videos/{camera}/chunk_index"] = [placement[e][0] for e in original_order]
