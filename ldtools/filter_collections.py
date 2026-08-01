@@ -177,6 +177,7 @@ def verify_keyframe_starts(source_path: Path, starts: list[float], fps: float) -
     remuxing rests on — violations fail the dataset loudly (re-encoding is
     lossy and deliberately NOT a silent fallback).
     """
+    keyframes: set[float] = set()
     with av.open(str(source_path)) as source:
         stream = source.streams.video[0]
         time_base = stream.time_base or Fraction(1, 90000)
@@ -303,7 +304,13 @@ def unflatten_episode_stats(row: pd.Series) -> dict[str, dict[str, np.ndarray]]:
         value = row[column]
         if value is None:
             continue
-        stats.setdefault(feature, {})[key] = np.asarray(value)
+        array = np.asarray(value)
+        # Image stats live as flat [3] vectors in the episodes parquet but
+        # lerobot's aggregate_stats demands the original [3,1,1] (except
+        # the scalar count) — restore the shape it validates against.
+        if feature.startswith("observation.images.") and key != "count":
+            array = array.reshape(3, 1, 1)
+        stats.setdefault(feature, {})[key] = array
     return stats
 
 
@@ -467,6 +474,8 @@ def process_dataset(
             result["mode"] = "rebuild"
         validate_output(staging, len(plan.keep), fps)
         out_dir.parent.mkdir(parents=True, exist_ok=True)
+        if out_dir.exists():  # --force rerun
+            shutil.rmtree(out_dir)
         staging.rename(out_dir)
         result["status"] = "ok"
     except Exception as error:  # noqa: BLE001 - quarantine and continue the sweep
