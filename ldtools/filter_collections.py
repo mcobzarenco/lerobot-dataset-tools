@@ -134,8 +134,8 @@ def plan_episodes(dataset_dir: Path, thresholds: Thresholds, fps: float) -> Epis
         for p in sorted((dataset_dir / "data").rglob("*.parquet"))
     ]
     table = pd.concat(data_frames)
-    for episode, group in table.groupby("episode_index", sort=True):
-        episode = int(episode)
+    for episode_key, group in table.groupby("episode_index", sort=True):
+        episode = int(episode_key)  # type: ignore[arg-type]  # stubs widen groupby keys to Hashable
         if episode in drops:
             continue
         action = np.stack(list(group["action"].to_numpy())).astype(np.float64)
