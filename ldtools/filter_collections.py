@@ -410,12 +410,23 @@ def rebuild_dataset(
                 column = f"stats/{feature}/{key}"
                 if column not in kept_meta.columns:
                     continue
-                # Match the column's existing element dtype (min/max are
-                # int64 lists, mean/std/quantiles float64) — mixed dtypes
-                # in one object column break the parquet conversion.
-                current = np.asarray(kept_meta.at[row, column]).ravel()
-                dtype = current.dtype if current.size else np.float64
+                # Explicit dtypes (int features keep int64 min/max, the
+                # rest float64). Inheriting from existing cells is a trap:
+                # some sources nest these as object arrays-of-arrays, and
+                # one inherited object-dtype cell breaks the whole column's
+                # arrow conversion.
+                dtype = np.int64 if key in ("min", "max") else np.float64
                 kept_meta.at[row, column] = np.array([value], dtype=dtype)
+    # Normalize any remaining nested object cells in these columns (mixed
+    # nesting across rows breaks pyarrow even without our edits).
+    for feature in ("episode_index", "index"):
+        for column in [c for c in kept_meta.columns if c.startswith(f"stats/{feature}/")]:
+            kept_meta[column] = [
+                np.atleast_1d(deep_float(cell)).astype(
+                    np.int64 if column.endswith(("/min", "/max", "/count")) else np.float64
+                )
+                for cell in kept_meta[column].to_list()
+            ]
     for camera in [f"observation.images.{c}" for c in cameras]:
         placement = placements[camera]
         kept_meta[f"videos/{camera}/chunk_index"] = [placement[e][0] for e in original_order]
